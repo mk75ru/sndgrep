@@ -2,13 +2,14 @@ TEMPLATE = lib
 CONFIG += dynamiclib plugin
 CONFIG += qt
 
-LIBS += -lfftw
+LIBS += -lfftw3
 
 HEADERS += \
 	sndgrep.h  \
 
 SOURCES += \
-	sndgrep.c
+        sndgrep.c \
+
 
 
 include(../root.pri)
@@ -18,7 +19,7 @@ TARGET = $${PRJ_LIB}/sndgrep
 
 
 VPATH += \
-	./ \
+        src \
 
 INCLUDEPATH += \
-	./ \
+        src \

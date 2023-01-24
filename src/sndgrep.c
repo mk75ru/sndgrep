@@ -22,11 +22,11 @@
 #define DTMF_HI         1 /* High frequency index */
 #define DTMF_BAD_DIGIT -1 /* -1 isnt a key :-)    */
 
-
 /* Bit-maskable flags */
 #define FLAG_NONE    0
 #define FLAG_VERBOSE 1
 #define FLAG_DTMF    2
+
 
 
 #define ERR(...) \
@@ -230,7 +230,6 @@ static void gen_tone(const char *fname, float secs, int tone, int flags)
     free(data);
 }
 
-
 void analyize_tone(const char *fname, int tone, int flags)
 {
     int i, n_samples, found, second, secs;
@@ -328,4 +327,7 @@ void analyize_tone(const char *fname, int tone, int flags)
     fclose(fp);
 }
 
+void search_dtmf(const char *fname){
+    analyize_tone(fname, -1,FLAG_DTMF);
+}
 
