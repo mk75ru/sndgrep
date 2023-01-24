@@ -1,0 +1,331 @@
+#include <stdio.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <fftw3.h>
+#include <getopt.h>
+#include <limits.h>
+#include <math.h>
+#include <sys/stat.h>
+#ifdef DEBUG_PLAYSOUND
+#include <alsa/asoundlib.h>
+#endif
+
+#include "sndgrep.h"
+
+#define RATE            8000 /* 8.0kHz */
+#define PI2             (M_PI*2.0)
+#define TAG             "sndgrep"
+#define DTMF_LO         0 /* Low frequency index  */
+#define DTMF_HI         1 /* High frequency index */
+#define DTMF_BAD_DIGIT -1 /* -1 isnt a key :-)    */
+
+
+/* Bit-maskable flags */
+#define FLAG_NONE    0
+#define FLAG_VERBOSE 1
+#define FLAG_DTMF    2
+
+
+#define ERR(...) \
+do {                                      \
+    fprintf(stderr, TAG": " __VA_ARGS__); \
+    fputc('\n', stderr);                  \
+    exit(EXIT_FAILURE);                   \
+} while ( 0 )
+
+
+#define ARRAY_LEN(_a) sizeof((_a))/sizeof((_a)[0])
+
+
+/* https://en.wikipedia.org/wiki/Dual-tone_multi-frequency_signaling */
+static const float dtmf[][2] =
+{
+    {941.0f, 1336.0f}, /* 0 */
+    {697.0f, 1209.0f}, /* 1 */
+    {697.0f, 1336.0f}, /* 2 */
+    {697.0f, 1477.0f}, /* 3 */
+    {770.0f, 1209.0f}, /* 4 */
+    {770.0f, 1336.0f}, /* 5 */
+    {770.0f, 1477.0f}, /* 6 */
+    {852.0f, 1209.0f}, /* 7 */
+    {852.0f, 1336.0f}, /* 8 */
+    {852.0f, 1477.0f}, /* 9 */
+};
+
+
+/* Each sample of audio is... */
+typedef double frame_t;
+
+
+/* Sets the number of bytes used in 'size' */
+static frame_t *make_dtmf(float secs, int key, size_t *size)
+{
+    int i;
+    double a, b, c;
+    frame_t *buf;
+
+    assert(size);
+    *size = sizeof(frame_t) * secs * RATE;
+    buf = fftw_malloc(*size);
+
+    /* Tone generator: DTMF
+     * RATE : Samples per second
+     * buf  : All the samples needed to supply audio for 'secs' seconds
+     * a    : Low DTMF tone at point 'i'
+     * b    : High DTMF tone at point 'i'
+     *
+     * tone at sample 'i' = sin(i * ((2*PI) * freq/RATE));
+     *
+     * More info at:
+     * https://stackoverflow.com/questions/1399501/generate-dtmf-tones
+     */
+    for (i=0; i<(secs * RATE); ++i)
+    {
+        a = sin(i*(PI2 * (dtmf[key][0]/8000.0)));
+        b = sin(i*(PI2 * (dtmf[key][1]/8000.0)));
+        c = ((a + b) * (double)(SHRT_MAX / 2.0));
+        buf[i] = c;
+#ifdef DEBUG_OUTPUT
+        printf("%f\n", buf[i]);
+        fflush(NULL);
+#endif
+    }
+
+    return buf;
+}
+
+
+static void dump_dtmf(fftw_complex *fft)
+{
+    int i;
+    float lo, hi;
+
+    for (i=0; i<ARRAY_LEN(dtmf); ++i)
+    {
+        lo = dtmf[i][0];
+        hi = dtmf[i][1];
+        printf("==> Tone %d (%.02fHz, %.02fHz): "
+               "Found (Low: %.02fHz, High: %.02fHz) <==\n",
+               i, lo, hi,
+               fft[(int)lo][1], fft[(int)hi][1]);
+    }
+}
+
+
+/* Search the DTMF tone bins and find the closest dtmf (hi and lo) that match.
+ * Returns the DTMF key that generates the two tones together.
+ */
+static int find_dtmf_digit(fftw_complex *fft)
+{
+    int i, lo_idx, hi_idx;
+    double lo, hi;
+
+    /* Find match */
+    for (i=0; i<ARRAY_LEN(dtmf); ++i)
+    {
+        lo_idx = (int)dtmf[i][DTMF_LO];
+        hi_idx = (int)dtmf[i][DTMF_HI];
+        lo = fabs(fft[lo_idx][1]);
+        hi = fabs(fft[hi_idx][1]);
+        if (lo > 1.0 && hi > 1.0)
+          return i;
+    };
+
+    return DTMF_BAD_DIGIT;
+}
+
+
+/* Returns true if 'tone' is found */
+static _Bool find_tone(int tone, int n, fftw_complex *fft, int flags)
+{
+    /* Take the FFT index (bin) and convert back to a frequency
+     * The freq represented by each bin is:
+     * freq = index * sample_rate / num_samples
+     * there are num_samples indexes or bins.
+     *
+     * Thanks to:
+     * https://stackoverflow.com/questions/4364823/how-to-get-frequency-from-fft-result
+     */
+    if (flags & FLAG_DTMF)
+    {
+        int digit = find_dtmf_digit(fft);
+        if (digit != DTMF_BAD_DIGIT)
+        {
+            printf("==> DTMF Key %d <==\n", digit);
+            return true;
+        }
+    }
+    else /* Else, not DTMF */
+    {
+        printf("Searched tone(%.02fHz)  ==>  ", (float)tone);
+        if (tone > n)
+        {
+            printf("N/A (choose a frequency less than %.02fHz)\n", (float)n);
+            return false;
+        }
+        else
+          printf("(Real: %.02fHz, Imag: %.02f)Hz\n", fft[tone][0], fft[tone][1]);
+        return true;
+    }
+
+    /* Should not get here */
+    return false;
+}
+
+
+static void gen_tone(const char *fname, float secs, int tone, int flags)
+{
+    FILE *fp;
+    size_t size;
+    frame_t *data;
+
+    if (secs <= 0)
+      ERR("Unsupported duration value: %.02f", secs);
+
+    if (tone < 0)
+      ERR("Please choose a tone greater than 0Hz\n");
+
+    if (flags & FLAG_DTMF)
+      printf("==> Writing DTMF key tone %d for %.02f second%s to %s...\n",
+             tone, secs, (secs == 1.0f) ? "" : "s", fname);
+
+    data = make_dtmf(secs, tone, &size);
+
+    /* If no fname, use stdout */
+    if (fname && !(fp = fopen(fname, "wb")))
+      ERR("Could not open %s for writing", fname);
+    else if (!fname)
+      fp = stdout;
+
+    if (!fp)
+      ERR("Could not locate an output file or stdout to write to");
+
+    if (fwrite(data, 1, size, fp) != size)
+      ERR("Error writing data to %s", fname);
+
+    /* Based on the simple ALSA example:
+     * http://www.alsa-project.org/alsa-doc/alsa-lib/_2test_2pcm_min_8c-example.html
+     */
+#ifdef DEBUG_PLAYSOUND
+    {
+        snd_pcm_t *dev;
+        snd_pcm_sframes_t frames;
+        if (snd_pcm_open(&dev, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0)
+          ERR("Error opening the default sound device");
+        if (snd_pcm_set_params(dev, SND_PCM_FORMAT_FLOAT64,
+                               SND_PCM_ACCESS_RW_INTERLEAVED,
+                               1, RATE, 1, 0) < 0)
+          ERR("Error setting audio device options");
+        if ((frames = snd_pcm_writei(dev, data, size) < 0))
+          frames = snd_pcm_recover(dev, frames, 0);
+        if (frames < 0)
+          ERR("Error writing to the sound device");
+        snd_pcm_close(dev);
+    }
+#endif /* DEBUG_PLAYSOUND */
+    fclose(fp);
+    free(data);
+}
+
+
+void analyize_tone(const char *fname, int tone, int flags)
+{
+    int i, n_samples, found, second, secs;
+    double *data;
+    frame_t frame;
+    FILE *fp;
+    size_t size, byte, ret;
+    struct stat stat;
+    fftw_plan plan;
+    fftw_complex *out;
+    const size_t frame_sz  = sizeof(double);
+
+    if (!(flags & FLAG_DTMF) && (tone <= 0))
+      ERR("Please choose a tone greater than 0.00Hz");
+    else if ((flags & FLAG_DTMF) && (tone > 0))
+      ERR("Do not specify a tone when searching DTMF,"
+          " all digit tones (0-9) are searched");
+
+    if (!fname)
+      fp = stdin;
+    else if (!(fp = fopen(fname, "rb")))
+      ERR("Could not open %s for reading", fname);
+
+    /* How big one second of audio is */
+    n_samples = RATE;
+    size = RATE * frame_sz;
+
+    /* Determine how much data needs to be read in */
+    if (fp != stdin)
+    {
+        fstat(fileno(fp), &stat);
+        secs = stat.st_size / size;
+    }
+    else
+      secs = 1;
+
+    /* Read in one second of audio at a time */
+    second = found = 0;
+    while (secs)
+    {
+        /* Only modify seconds if we actually know how much data there is to
+         * read in... that is, if we have a file, if not, and only have a stream
+         * (stdin) then we wait till an EOF... at the bottom of this loop
+         */
+        ++second;
+        if (fp != stdin)
+          --secs;
+
+        /* Suck in the data */
+        data = malloc(sizeof(double) * (size/sizeof(frame_t)));
+        byte = 0;
+        for (i=0; i<size/sizeof(frame_t); ++i)
+        {
+            ret = fread(&frame, 1, sizeof(frame), fp);
+            if (ret == -1 || ((fp!=stdin && ret!=sizeof(frame))))
+              ERR("Error extracting data from input stream: "
+                  "read %zd of %zd bytes", ret, sizeof(frame));
+            byte += sizeof(frame);
+            data[i] = (double)frame;
+#ifdef DEBUG_OUTPUT
+            printf("%f\n", (frame_t)data[i]);
+            fflush(NULL);
+#endif
+        }
+
+        /* Process data */
+        out = fftw_malloc(sizeof(fftw_complex) * n_samples);
+        plan = fftw_plan_dft_r2c_1d(n_samples, data, out, FFTW_ESTIMATE);
+        fftw_execute(plan);
+
+        /* Read the results */
+        if (find_tone(i, secs * RATE, out, flags))
+        {
+            ++found;
+            printf("==> Match located at %d second%s in the data stream <==\n",
+                   second, (second > 1) ? "s" : "");
+        }
+
+        /* Clean up */
+        fftw_destroy_plan(plan);
+        fftw_free(out);
+        fftw_free(data);
+
+        /* Ending case */
+        if (feof(fp) || ferror(fp))
+          break;
+    }
+
+    if (!found)
+      printf("==> Tone could not be located\n");
+
+    if (flags & FLAG_VERBOSE)
+      dump_dtmf(out);
+
+    fclose(fp);
+}
+
+
