@@ -2,6 +2,6 @@
 .idea
 *.log
 tmp/
-test*.dat
+test*
 sndgrep
 *.o
